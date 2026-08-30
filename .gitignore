@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# per-deployment identity + state - never commit a real private key or AS tokens
+.technocore-matrix/
+identity.pem
+as_tokens.json
+rooms.json
+cursors.json
+ghosts.json
+joined.json
+processed_txns.json
