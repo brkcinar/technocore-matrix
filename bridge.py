@@ -1,267 +1,328 @@
 #!/usr/bin/env python3
-"""
-technocore-matrix - a Matrix Application Service bridge for technocore.chat rooms,
-implementing the shape flop-labs/technocore-chat's own docs/interop.md Matrix section
-describes.
-
-interop.md: "Matrix bridges third-party networks through an Application Service: you
-register a namespace of user ids and room aliases with a homeserver, it pushes events to
-you, and you act as any user in your namespace. This is the closest fit of the six, because
-Matrix's /sync?since= and this service's ?since=&wait= are the same idea, and puppeting
-gives the identity distinction above somewhere natural to live."
-
-What this registers and mints, per interop.md's own instructions:
-
-- **Namespace `@tc_.*` / `#tc_.*`** on the homeserver, via an Application Service
-  registration (see `register` subcommand) - this is what makes the homeserver push events
-  in that namespace to this bridge instead of handling them itself.
-- **One ghost per did:key writer** (`@tc_<fingerprint>:<domain>`), ghosts of the writer
-  puppeting technocore.chat's writer into Matrix. Unlike this ecosystem's ActivityPub bridge
-  (where a per-writer identity confirmed live does NOT surface in a follower's timeline),
-  Matrix's room timeline renders every event's own `sender` distinctly by design - puppeting
-  is the standard, load-bearing pattern real Matrix bridges use (IRC, Discord, etc.), not an
-  experimental one. Still verify live before trusting this note over what you observe.
-- **A single shared ghost for every unsigned writer** (`@tc_anon:<domain>`), with the
-  claimed nickname put in the message body - interop.md's "collapse every unsigned writer
-  into one shared actor" pattern, mirrored here for the unsigned lane exactly as the
-  ActivityPub bridge does.
-- The same collapsing in reverse for *inbound*: a real Matrix user's message is written into
-  technocore.chat as one signed message under the bridge's own did:key identity, with their
-  Matrix id in the body - a Matrix account has no technocore did:key to hold.
-
-**Room topic maps to `/kv/topic/<room>`** (interop.md: "`m.room.topic` maps to
-`/kv/topic/<room>`, with `?if=` settling a clobber race") - set once, when this bridge
-creates the room, and not fought over afterward.
-
-**No redaction.** interop.md: "Redaction is the one thing not to implement. It promises the
-content is gone, and here it is not." A Matrix-side redaction is not mirrored back to
-technocore.chat; nothing here would make that safe to claim.
-
-Dependency: only `cryptography` (Ed25519 for the bridge's own technocore did:key identity,
-same primitive this ecosystem's other tools already use) - the rest is standard library.
-Talks to a homeserver's Application Service + Client-Server APIs directly over HTTP; no
-Matrix SDK.
-"""
+"""A small, durable Matrix application-service bridge for technocore.chat."""
 
 from __future__ import annotations
 
 import argparse
 import base64
 import collections
+import contextlib
+import fcntl
 import hashlib
 import json
+import math
+import os
 import re
 import secrets
+import stat
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 APP_NAME = "technocore-matrix"
-APP_VERSION = "0.1.0"
-
+APP_VERSION = "0.2.0"
 TECHNOCORE_BASE = "https://technocore.chat"
 DEFAULT_HOME = Path.home() / ".technocore-matrix"
 DEFAULT_HS_URL = "http://127.0.0.1:8008"
-MESSAGE_MAX_CHARS = 4096
-POLL_WAIT_SECONDS = 10
-DELIVERY_MAX_WORKERS = 8
-LARGE_BATCH_WARN_THRESHOLD = 50
-DEFAULT_MAX_PER_MINUTE = 10  # see technocore-activitypub's README - the same lesson applies
-MAX_TXN_BODY_BYTES = 4_194_304  # 4 MiB - a homeserver transaction can legitimately batch many events
+ROOM_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
+DOMAIN_RE = re.compile(r"^(?=.{1,255}$)(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::[0-9]{1,5})?$")
+DID_RE = re.compile(r"^did:key:z[1-9A-HJ-NP-Za-km-z]+$")
+BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 MULTICODEC_ED25519 = b"\xed\x01"
-BASE58BTC_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-
+MESSAGE_MAX_CHARS = 4096
+MAX_TXN_BODY_BYTES = 4_194_304
+MAX_TXN_EVENTS = 1000
+MAX_ROOMS = 256
+LEDGER_LIMIT = 4096
+POLL_WAIT_SECONDS = 10
+DEFAULT_MAX_PER_MINUTE = 10.0
 UA = f"{APP_NAME}/{APP_VERSION}"
 
 
 class BridgeError(Exception):
-    pass
+    """Fail-closed bridge operation error."""
 
 
-class RateLimiter:
-    """Token bucket, `capacity` tokens refilled at `rate_per_minute` per minute - see
-    technocore-activitypub's README for why this exists at all (confirmed live there that
-    even a moderately-active room floods a follower fast; the same technocore.chat rooms are
-    the source here too, so the same limit applies)."""
-
-    def __init__(self, rate_per_minute: float):
-        self.rate_per_second = rate_per_minute / 60.0
-        self.capacity = max(1.0, rate_per_minute)
-        self.tokens = self.capacity
-        self.last_refill = time.monotonic()
-        self.lock = threading.Lock()
-
-    def try_take(self) -> bool:
-        with self.lock:
-            now = time.monotonic()
-            self.tokens = min(self.capacity, self.tokens + (now - self.last_refill) * self.rate_per_second)
-            self.last_refill = now
-            if self.tokens < 1.0:
-                return False
-            self.tokens -= 1.0
-            return True
+class RetryableError(BridgeError):
+    """An operation the caller should retry."""
 
 
-# =============================================================== bridge's own did:key
+class ReplayForkError(BridgeError):
+    """A durable identifier was reused for different content."""
+
+
+class MatrixError(BridgeError):
+    def __init__(self, message: str, status: int | None = None, retryable: bool = False):
+        super().__init__(message)
+        self.status = status
+        self.retryable = retryable
+
+
+def validate_room(room: str) -> str:
+    if not isinstance(room, str) or ROOM_RE.fullmatch(room) is None:
+        raise ValueError(f"invalid technocore room name: {room!r}")
+    return room
+
+
+def validate_domain(domain: str) -> str:
+    if not isinstance(domain, str) or DOMAIN_RE.fullmatch(domain) is None:
+        raise ValueError(f"invalid Matrix domain: {domain!r}")
+    host, sep, port = domain.rpartition(":")
+    if sep and port.isdigit() and int(port) > 65535:
+        raise ValueError(f"invalid Matrix domain port: {domain!r}")
+    return domain
+
+
+def validate_base_url(value: str, name: str = "URL") -> str:
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
+        raise ValueError(f"invalid {name}: {value!r}")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError(f"{name} must be an HTTP(S) origin without a path")
+    return value.rstrip("/")
 
 
 def base58btc_encode(data: bytes) -> str:
-    zeroes = len(data) - len(data.lstrip(b"\x00"))
+    zeroes = len(data) - len(data.lstrip(b"\0"))
     number = int.from_bytes(data, "big")
     encoded = ""
     while number:
         number, remainder = divmod(number, 58)
-        encoded = BASE58BTC_ALPHABET[remainder] + encoded
+        encoded = BASE58[remainder] + encoded
     return "1" * zeroes + encoded
 
 
-def did_from_private_key(private_key: Ed25519PrivateKey) -> str:
-    public_bytes = private_key.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+def base58btc_decode(value: str) -> bytes:
+    number = 0
+    for char in value:
+        if char not in BASE58:
+            raise ValueError("invalid base58btc")
+        number = number * 58 + BASE58.index(char)
+    raw = number.to_bytes((number.bit_length() + 7) // 8, "big")
+    return b"\0" * (len(value) - len(value.lstrip("1"))) + raw
+
+
+def valid_ed25519_did(did: object) -> bool:
+    if not isinstance(did, str) or DID_RE.fullmatch(did) is None:
+        return False
+    try:
+        decoded = base58btc_decode(did[9:])
+    except ValueError:
+        return False
+    return decoded.startswith(MULTICODEC_ED25519) and len(decoded) == 34 and (
+        "did:key:z" + base58btc_encode(decoded) == did
     )
-    return "did:key:z" + base58btc_encode(MULTICODEC_ED25519 + public_bytes)
 
 
-def sign_message(private_key: Ed25519PrivateKey, payload: bytes) -> str:
-    return base64.urlsafe_b64encode(private_key.sign(payload)).decode("ascii").rstrip("=")
-
-
-def load_or_create_ed25519(path: Path) -> Ed25519PrivateKey:
-    if path.exists():
-        return serialization.load_pem_private_key(path.read_bytes(), password=None)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    key = Ed25519PrivateKey.generate()
-    path.write_bytes(
-        key.private_bytes(
-            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+def verified_record_did(room: str, message: dict) -> str | None:
+    did, nonce, signature, text = (
+        message.get("from"), message.get("nonce"), message.get("sig"), message.get("text")
+    )
+    if not valid_ed25519_did(did) or not isinstance(nonce, int) or isinstance(nonce, bool):
+        return None
+    if nonce < 1 or nonce >= 10**19 or not isinstance(signature, str) or len(signature) != 86:
+        return None
+    if not isinstance(text, str):
+        return None
+    try:
+        raw_signature = base64.urlsafe_b64decode(signature + "==")
+        if len(raw_signature) != 64:
+            return None
+        if base64.urlsafe_b64encode(raw_signature).decode().rstrip("=") != signature:
+            return None
+        public_bytes = base58btc_decode(did[9:])[2:]
+        Ed25519PublicKey.from_public_bytes(public_bytes).verify(
+            raw_signature, f"{room}|{nonce}|{text}".encode()
         )
-    )
-    path.chmod(0o600)
-    return key
+    except (ValueError, InvalidSignature):
+        return None
+    return did
+
+
+def did_from_private_key(key: Ed25519PrivateKey) -> str:
+    raw = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return "did:key:z" + base58btc_encode(MULTICODEC_ED25519 + raw)
 
 
 def did_fingerprint16(did: str) -> str:
-    return hashlib.sha256(did.encode("utf-8")).hexdigest()[:16]
+    if not valid_ed25519_did(did):
+        raise ValueError("not a canonical Ed25519 did:key")
+    return hashlib.sha256(did.encode()).hexdigest()[:16]
 
 
-# =================================================================== technocore.chat client
+def sign_message(key: Ed25519PrivateKey, payload: bytes) -> str:
+    return base64.urlsafe_b64encode(key.sign(payload)).decode().rstrip("=")
 
 
-def technocore_get(base: str, path: str, params: dict | None = None, timeout: float = 15) -> bytes:
-    url = base.rstrip("/") + path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(url, headers={"User-Agent": UA})
-    last_exc: Exception | None = None
-    for attempt in range(4):
+def ensure_private_home(home: Path) -> None:
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = home.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise BridgeError(f"bridge home is not a real directory: {home}")
+    home.chmod(0o700)
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    ensure_private_home(path.parent)
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        path.chmod(0o600)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+def load_json(path: Path, default=None):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise BridgeError(f"corrupt state file {path}") from exc
+
+
+def save_json(path: Path, data) -> None:
+    atomic_write(path, (json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n").encode())
+
+
+def require_regular_file(path: Path, missing_ok: bool = False) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        if missing_ok:
+            return False
+        raise BridgeError(f"missing sensitive file {path}")
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise BridgeError(f"sensitive path is not a regular file: {path}")
+    return True
+
+
+@contextlib.contextmanager
+def creation_lock(path: Path):
+    lock_path = path.parent / ("." + path.name + ".lock")
+    if require_regular_file(lock_path, missing_ok=True):
+        flags = os.O_RDWR
+    else:
+        flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise BridgeError(f"cannot securely open creation lock {lock_path}") from exc
+    stream = os.fdopen(descriptor, "a+", encoding="utf-8")
+    os.fchmod(stream.fileno(), 0o600)
+    try:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(stream, fcntl.LOCK_UN)
+        stream.close()
+
+
+def load_or_create_ed25519(path: Path) -> Ed25519PrivateKey:
+    ensure_private_home(path.parent)
+    with creation_lock(path):
+        if require_regular_file(path, missing_ok=True):
+            path.chmod(0o600)
+            try:
+                key = serialization.load_pem_private_key(path.read_bytes(), password=None)
+            except Exception as exc:
+                raise BridgeError(f"invalid identity file {path}") from exc
+            if not isinstance(key, Ed25519PrivateKey):
+                raise BridgeError("identity is not an Ed25519 private key")
+            return key
+        key = Ed25519PrivateKey.generate()
+        raw = key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+        )
+        atomic_write(path, raw)
+        return key
+
+
+def load_or_create_tokens(home: Path) -> tuple[str, str]:
+    ensure_private_home(home)
+    path = home / "as_tokens.json"
+    with creation_lock(path):
+        if require_regular_file(path, missing_ok=True):
+            path.chmod(0o600)
+            data = load_json(path)
+            if not isinstance(data, dict) or not all(
+                isinstance(data.get(k), str) and len(data[k]) >= 32
+                for k in ("as_token", "hs_token")
+            ):
+                raise BridgeError(f"invalid token state {path}")
+            return data["as_token"], data["hs_token"]
+        data = {"as_token": secrets.token_hex(32), "hs_token": secrets.token_hex(32)}
+        save_json(path, data)
+        return data["as_token"], data["hs_token"]
+
+
+def _retry_after(exc: urllib.error.HTTPError, attempt: int) -> float:
+    value = exc.headers.get("Retry-After") if exc.headers else None
+    try:
+        return min(max(float(value), 0.0), 30.0)
+    except (TypeError, ValueError):
+        return min(0.25 * (2**attempt), 4.0)
+
+
+def _http_json(request: urllib.request.Request, timeout: float = 15, attempts: int = 4) -> dict:
+    last: Exception | None = None
+    for attempt in range(attempts):
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read()
+                raw = response.read()
+                value = json.loads(raw.decode()) if raw else {}
+                if not isinstance(value, dict):
+                    raise BridgeError("HTTP response is not a JSON object")
+                return value
         except urllib.error.HTTPError as exc:
-            if exc.code == 404 or (exc.code < 500 and exc.code != 429):
-                raise
-            last_exc = exc
-        except (urllib.error.URLError, OSError, TimeoutError) as exc:
-            last_exc = exc
-        time.sleep(min(0.5 * (2**attempt), 5))
-    raise BridgeError(f"GET {path} failed after retries: {last_exc}")
-
-
-def technocore_read_room(base: str, room: str, since: int, wait: int = 0) -> dict:
-    body = technocore_get(base, f"/r/{room}", {"since": since, "wait": wait, "format": "json"}, timeout=wait + 5)
-    return json.loads(body.decode("utf-8"))
-
-
-def technocore_say_signed(base: str, key: Ed25519PrivateKey, did: str, room: str, text: str) -> int:
-    if len(text) > MESSAGE_MAX_CHARS:
-        text = text[: MESSAGE_MAX_CHARS - 1] + "…"
-    nonce = str(time.time_ns())
-    payload = f"{room}|{nonce}|{text}".encode("utf-8")
-    signature = sign_message(key, payload)
-    body = json.dumps({"did": did, "sig": signature, "nonce": nonce, "text": text}).encode("utf-8")
-    url = base.rstrip("/") + f"/r/{room}?format=json"
-    last_exc: Exception | None = None
-    for attempt in range(4):
-        request = urllib.request.Request(
-            url, data=body, headers={"Content-Type": "application/json", "User-Agent": UA}, method="POST"
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                return json.loads(response.read().decode("utf-8"))["posted"]["seq"]
-        except urllib.error.HTTPError as exc:
-            if exc.code < 500:
-                raise BridgeError(f"signed write to {room} -> {exc.code} {exc.read().decode('utf-8','replace')}") from exc
-            last_exc = exc
-        except (urllib.error.URLError, OSError, TimeoutError) as exc:
-            last_exc = exc
-        time.sleep(min(0.5 * (2**attempt), 5))
-    raise BridgeError(f"signed write to {room} failed after retries: {last_exc}")
-
-
-def kv_set(base: str, ns: str, key: str, value: str) -> None:
-    url = base.rstrip("/") + f"/kv/{ns}/{key}/set/{urllib.parse.quote(value, safe='')}"
-    request = urllib.request.Request(url, headers={"User-Agent": UA})
-    try:
-        with urllib.request.urlopen(request, timeout=10):
-            pass
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError, TimeoutError):
-        pass  # best-effort; the topic just won't be set this time, not fatal to the bridge
-
-
-UNTRUSTED_BANNER_PREFIX = "!! UNTRUSTED CONTENT"
-
-
-def strip_untrusted_banner(body: str) -> str:
-    """A plain /kv/<ns>/<key> read always prepends a warning banner + blank line before the
-    value (confirmed live - see technocore-a2a). Not used for writes; kv_set here is
-    fire-and-forget and never reads its own value back."""
-    if body.startswith(UNTRUSTED_BANNER_PREFIX):
-        _, _, rest = body.partition("\n\n")
-        return rest.rstrip("\n")
-    return body.rstrip("\n")
-
-
-# ======================================================================== Matrix HTTP client
-
-
-class MatrixError(Exception):
-    pass
+            retryable = exc.code == 429 or exc.code >= 500
+            if not retryable:
+                detail = exc.read(2048).decode("utf-8", "replace")
+                raise MatrixError(f"HTTP {exc.code}: {detail}", exc.code, False) from exc
+            last = exc
+            if attempt + 1 < attempts:
+                time.sleep(_retry_after(exc, attempt))
+        except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError) as exc:
+            last = exc
+            if attempt + 1 < attempts:
+                time.sleep(min(0.25 * (2**attempt), 4))
+    raise MatrixError(f"request failed after retries: {last}", retryable=True)
 
 
 def matrix_request(
-    hs_url: str, method: str, path: str, token: str, body: dict | None = None, user_id: str | None = None, timeout: float = 15
+    hs_url: str, method: str, path: str, token: str, body: dict | None = None,
+    user_id: str | None = None, timeout: float = 15,
 ) -> dict:
-    params = {}
-    if user_id:
-        params["user_id"] = user_id
     url = hs_url.rstrip("/") + path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    data = json.dumps(body).encode("utf-8") if body is not None else None
+    if user_id:
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode({"user_id": user_id})
     request = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
+        url, method=method, data=None if body is None else json.dumps(body).encode(),
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": UA},
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read()
-            return json.loads(raw.decode("utf-8")) if raw else {}
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")
-        raise MatrixError(f"{method} {path} -> {exc.code} {detail}") from exc
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        raise MatrixError(f"{method} {path} failed: {exc}") from exc
+    return _http_json(request, timeout)
 
 
 def matrix_errcode(exc: MatrixError) -> str | None:
@@ -269,495 +330,925 @@ def matrix_errcode(exc: MatrixError) -> str | None:
     return match.group(1) if match else None
 
 
-# ==================================================================================== state
+def technocore_get(base: str, path: str, params: dict | None = None, timeout: float = 15) -> bytes:
+    url = base.rstrip("/") + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(url, headers={"User-Agent": UA})
+    last: Exception | None = None
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 and exc.code < 500:
+                raise
+            last = exc
+            if attempt < 3:
+                time.sleep(_retry_after(exc, attempt))
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            last = exc
+            if attempt < 3:
+                time.sleep(min(.25 * (2**attempt), 4))
+    raise RetryableError(f"GET {path} failed after retries: {last}")
 
 
-def load_json(path: Path, default):
-    if not path.exists():
-        return default
+def technocore_read_room(base: str, room: str, since: int | None = None, wait: int = 0) -> dict:
+    params: dict[str, object] = {"format": "json", "limit": 200, "n": secrets.token_hex(8)}
+    if since is not None:
+        params.update({"since": since, "wait": wait})
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return default
+        value = json.loads(technocore_get(base, f"/r/{room}", params, wait + 15).decode())
+    except urllib.error.HTTPError as exc:
+        raise BridgeError(f"room read permanently failed: HTTP {exc.code}") from exc
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise BridgeError("malformed technocore room response") from exc
+    if not isinstance(value, dict):
+        raise BridgeError("malformed technocore room response")
+    return value
 
 
-def save_json(path: Path, data) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    tmp.replace(path)
+def strip_untrusted_banner(body: str) -> str:
+    if body.startswith("!! UNTRUSTED CONTENT"):
+        return body.partition("\n\n")[2].rstrip("\n")
+    return body.rstrip("\n")
+
+
+def kv_get(base: str, namespace: str, key: str) -> str | None:
+    try:
+        return strip_untrusted_banner(
+            technocore_get(base, f"/kv/{namespace}/{key}", {"n": secrets.token_hex(8)}).decode()
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise RetryableError(f"note read failed: HTTP {exc.code}") from exc
+
+
+def kv_set_cas(base: str, namespace: str, key: str, value: str, previous: str | None) -> None:
+    path = f"/kv/{namespace}/{key}/set/{urllib.parse.quote(value, safe='')}"
+    params = {"if_absent": "1"} if previous is None else {"if": previous}
+    url = base.rstrip("/") + path + "?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(request, timeout=15):
+            return
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            raise RetryableError("topic compare-and-set conflict") from exc
+        raise RetryableError(f"topic write failed: HTTP {exc.code}") from exc
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        raise RetryableError("topic write failed") from exc
+
+
+def sanitize_line(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    cleaned = []
+    for char in normalized:
+        point = ord(char)
+        category = unicodedata.category(char)
+        noncharacter = 0xFDD0 <= point <= 0xFDEF or point & 0xFFFF in {0xFFFE, 0xFFFF}
+        cleaned.append(" " if category in {"Cc", "Cf", "Cs", "Co", "Zl", "Zp"} or noncharacter else char)
+    return " ".join("".join(cleaned).split())[:MESSAGE_MAX_CHARS]
+
+
+def canonical_digest(value: object) -> str:
+    try:
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode()
+    except (TypeError, ValueError) as exc:
+        raise BridgeError("value cannot be canonically encoded") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def event_marker(event_id: str) -> str:
+    return "[mx:" + hashlib.sha256(event_id.encode()).hexdigest()[:16] + "]"
+
+
+_nonce_lock = threading.Lock()
+_last_nonce = 0
+
+
+def _fresh_nonce() -> str:
+    global _last_nonce
+    with _nonce_lock:
+        _last_nonce = max(_last_nonce + 1, time.time_ns())
+        if _last_nonce >= 10**19:
+            raise BridgeError("nonce clock exceeds 19 digits")
+        return str(_last_nonce)
+
+
+def signed_frame_landed(base: str, room: str, did: str, text: str) -> bool:
+    view = technocore_read_room(base, room)
+    messages = view.get("messages")
+    if not isinstance(messages, list):
+        raise RetryableError("malformed reconciliation response")
+    return any(
+        isinstance(message, dict)
+        and verified_record_did(room, message) == did
+        and message.get("text") == text
+        and isinstance(message.get("seq"), int)
+        and not isinstance(message.get("seq"), bool)
+        for message in messages[-200:]
+    )
+
+
+def technocore_say_signed(
+    base: str, key: Ed25519PrivateKey, did: str, room: str, text: str, marker: str | None = None,
+) -> int:
+    text = sanitize_line(text)
+    last: Exception | None = None
+    for attempt in range(4):
+        nonce = _fresh_nonce()
+        signature = sign_message(key, f"{room}|{nonce}|{text}".encode())
+        body = json.dumps({"did": did, "sig": signature, "nonce": nonce, "text": text}).encode()
+        request = urllib.request.Request(
+            base.rstrip("/") + f"/r/{room}?format=json", data=body, method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": UA},
+        )
+        try:
+            value = _http_json(request, attempts=1)
+            seq = value.get("posted", {}).get("seq")
+            if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+                raise RetryableError("malformed signed-write response")
+            return seq
+        except MatrixError as exc:
+            last = exc
+            if not exc.retryable and exc.status not in {408, 409, 429}:
+                raise BridgeError(f"signed write permanently failed: {exc}") from exc
+        except RetryableError as exc:
+            last = exc
+        if marker and signed_frame_landed(base, room, did, text):
+            return 0
+        if attempt < 3:
+            time.sleep(min(.25 * (2**attempt), 4))
+    raise RetryableError(f"signed write failed after retries: {last}")
+
+
+class RateLimiter:
+    """Optional non-lossy per-room throttle."""
+
+    def __init__(self, per_minute: float):
+        self.interval = 60.0 / per_minute if per_minute > 0 else 0.0
+        self.next = 0.0
+        self.lock = threading.Lock()
+
+    def wait(self) -> None:
+        with self.lock:
+            delay = self.next - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            self.next = time.monotonic() + self.interval
+
+
+def _valid_localpart(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"tc_(?:anon|bridge|[0-9a-f]{16})", value) is not None
+
+
+def _validate_loaded_state(state: object) -> dict:
+    if not isinstance(state, dict):
+        raise BridgeError("state root is not an object")
+    expected = {
+        "rooms": dict, "cursors": dict, "epochs": dict, "checkpoints": dict,
+        "ghosts": list, "joined": dict, "events": dict, "txns": dict,
+        "topics": dict, "pending_topics": dict,
+    }
+    if set(state) - set(expected):
+        raise BridgeError("unknown bridge state fields")
+    result = {key: state.get(key, kind()) for key, kind in expected.items()}
+    if not all(isinstance(result[key], kind) for key, kind in expected.items()):
+        raise BridgeError("invalid bridge state collection")
+    room_keys = set()
+    for collection in ("rooms", "cursors", "epochs", "checkpoints", "joined", "topics"):
+        room_keys.update(result[collection])
+    if any(not isinstance(room, str) or ROOM_RE.fullmatch(room) is None for room in room_keys):
+        raise BridgeError("invalid room key in state")
+    if any(
+        not isinstance(room_id, str) or len(room_id) > 1024 or not room_id.startswith("!") or
+        any(ord(char) < 33 for char in room_id)
+        for room_id in result["rooms"].values()
+    ):
+        raise BridgeError("invalid Matrix room ID in state")
+    for collection in ("cursors", "epochs"):
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in result[collection].values()
+        ):
+            raise BridgeError(f"invalid {collection} state")
+    if any(
+        not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in result["checkpoints"].values()
+    ):
+        raise BridgeError("invalid checkpoint state")
+    for room, cursor in result["cursors"].items():
+        if cursor and room not in result["checkpoints"]:
+            raise BridgeError(f"nonzero cursor for {room} lacks a checkpoint")
+    if (
+        any(not _valid_localpart(value) for value in result["ghosts"])
+        or len(result["ghosts"]) != len(set(result["ghosts"]))
+    ):
+        raise BridgeError("invalid ghost state")
+    for values in result["joined"].values():
+        if (
+            not isinstance(values, list) or any(not _valid_localpart(value) for value in values)
+            or len(values) != len(set(values))
+        ):
+            raise BridgeError("invalid joined state")
+    for event_id, record in result["events"].items():
+        if (
+            not isinstance(event_id, str) or not event_id or len(event_id) > 1024
+            or not isinstance(record, dict) or set(record) != {"status", "digest"}
+            or record["status"] not in {"pending", "done"}
+            or not isinstance(record["digest"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", record["digest"]) is None
+        ):
+            raise BridgeError("invalid event ledger")
+    if len(result["events"]) > LEDGER_LIMIT:
+        raise BridgeError("oversized event ledger")
+    if any(
+        not isinstance(txn, str) or not txn or len(txn) > 1024
+        or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        for txn, digest in result["txns"].items()
+    ):
+        raise BridgeError("invalid transaction ledger")
+    if len(result["txns"]) > LEDGER_LIMIT:
+        raise BridgeError("invalid transaction ledger bounds")
+    if any(not isinstance(topic, str) or len(topic) > MESSAGE_MAX_CHARS for topic in result["topics"].values()):
+        raise BridgeError("invalid topic state")
+    for event_id, metadata in result["pending_topics"].items():
+        if (
+            not isinstance(event_id, str) or not isinstance(metadata, dict)
+            or set(metadata) != {"room", "desired", "previous"}
+            or not isinstance(metadata["room"], str) or ROOM_RE.fullmatch(metadata["room"]) is None
+            or not isinstance(metadata["desired"], str)
+            or metadata["previous"] is not None and not isinstance(metadata["previous"], str)
+            or len(metadata["desired"]) > MESSAGE_MAX_CHARS
+            or metadata["previous"] is not None and len(metadata["previous"]) > MESSAGE_MAX_CHARS
+            or result["events"].get(event_id, {}).get("status") != "pending"
+        ):
+            raise BridgeError("invalid pending topic state")
+    if len(result["pending_topics"]) > LEDGER_LIMIT:
+        raise BridgeError("oversized pending topic state")
+    return result
 
 
 class Bridge:
-    """All the state one running bridge process needs: the technocore did:key identity
-    (inbound writes), the AS/HS tokens, room-name <-> Matrix room-id mappings, which ghosts
-    have already been registered/joined (so we don't re-attempt every message), per-room
-    cursors, and processed-transaction dedup. Persisted under --home."""
+    ANON_LOCALPART = "tc_anon"
 
     def __init__(
-        self,
-        home: Path,
-        domain: str,
-        base: str,
-        hs_url: str,
-        as_token: str,
-        rooms: list[str],
+        self, home: Path, domain: str, base: str, hs_url: str, as_token: str, rooms: list[str],
         max_per_minute: float = DEFAULT_MAX_PER_MINUTE,
     ):
+        ensure_private_home(home)
+        if (
+            not isinstance(max_per_minute, (int, float)) or isinstance(max_per_minute, bool)
+            or not math.isfinite(max_per_minute) or max_per_minute < 0
+        ):
+            raise ValueError("max_per_minute must be finite and nonnegative")
         self.home = home
-        self.domain = domain
-        self.base = base
-        self.hs_url = hs_url
+        self.domain = validate_domain(domain)
+        self.base = validate_base_url(base, "technocore URL")
+        self.hs_url = validate_base_url(hs_url, "homeserver URL")
         self.as_token = as_token
-        self.rooms = rooms
+        self.rooms = [validate_room(r) for r in rooms]
+        if len(set(self.rooms)) != len(self.rooms):
+            raise ValueError("duplicate room")
         self.ed25519_key = load_or_create_ed25519(home / "identity.pem")
         self.did = did_from_private_key(self.ed25519_key)
-        self.rooms_path = home / "rooms.json"
-        self.room_ids: dict[str, str] = load_json(self.rooms_path, {})  # technocore room -> matrix room id
-        self.cursors_path = home / "cursors.json"
-        self.cursors: dict[str, int] = load_json(self.cursors_path, {})  # technocore room -> last_seq
-        self.ghosts_path = home / "ghosts.json"
-        self.registered_ghosts: set[str] = set(load_json(self.ghosts_path, []))  # localparts
-        self.joined_path = home / "joined.json"
-        self.joined: dict[str, list[str]] = load_json(self.joined_path, {})  # room -> [localpart, ...]
-        self.processed_txns_path = home / "processed_txns.json"
-        self.processed_txns: collections.OrderedDict[str, bool] = collections.OrderedDict(
-            (t, True) for t in load_json(self.processed_txns_path, [])
-        )
-        self.rate_limiters = {room: RateLimiter(max_per_minute) for room in rooms}
-        self.dropped_since_report: dict[str, int] = dict.fromkeys(rooms, 0)
-        self.last_drop_report: dict[str, float] = dict.fromkeys(rooms, 0.0)
-        self._lock = threading.Lock()
-        self.delivery_pool = ThreadPoolExecutor(max_workers=DELIVERY_MAX_WORKERS, thread_name_prefix="deliver")
+        self.state_path = home / "state.json"
+        state_exists = require_regular_file(self.state_path, missing_ok=True)
+        state = _validate_loaded_state(load_json(self.state_path, {}))
+        if state_exists:
+            self.state_path.chmod(0o600)
+        self.state = {
+            "rooms": state.get("rooms", {}), "cursors": state.get("cursors", {}),
+            "epochs": state.get("epochs", {}), "checkpoints": state.get("checkpoints", {}),
+            "ghosts": state.get("ghosts", []),
+            "joined": state.get("joined", {}), "events": state.get("events", {}),
+            "txns": state.get("txns", {}), "topics": state.get("topics", {}),
+            "pending_topics": state.get("pending_topics", {}),
+        }
+        self.room_ids = self.state["rooms"]
+        self.cursors = self.state["cursors"]
+        self.epochs = self.state["epochs"]
+        self.checkpoints = self.state["checkpoints"]
+        self.registered_ghosts = set(self.state["ghosts"])
+        self.joined = {k: set(v) for k, v in self.state["joined"].items()}
+        self.events = collections.OrderedDict(self.state["events"])
+        self.processed_txns = collections.OrderedDict(self.state["txns"])
+        self.topics = self.state["topics"]
+        self.pending_topics = self.state["pending_topics"]
+        self._lock = threading.RLock()
+        self.transaction_lock = threading.Lock()
+        self.ensure_locks = {r: threading.Lock() for r in self.rooms}
+        self.rate_limiters = {r: RateLimiter(max_per_minute) for r in self.rooms}
 
-    def save_rooms(self) -> None:
-        save_json(self.rooms_path, self.room_ids)
-
-    def save_cursors(self) -> None:
-        save_json(self.cursors_path, self.cursors)
-
-    def save_ghosts(self) -> None:
-        save_json(self.ghosts_path, sorted(self.registered_ghosts))
-
-    def save_joined(self) -> None:
-        save_json(self.joined_path, self.joined)
-
-    def mark_txn_processed(self, txn_id: str) -> None:
+    def save(self) -> None:
         with self._lock:
-            self.processed_txns[txn_id] = True
-            while len(self.processed_txns) > 2000:
-                self.processed_txns.popitem(last=False)
-            save_json(self.processed_txns_path, list(self.processed_txns))
-
-    def was_txn_processed(self, txn_id: str) -> bool:
-        return txn_id in self.processed_txns
-
-    # ------------------------------------------------------------------------------ naming
+            self.state.update({
+                "rooms": self.room_ids, "cursors": self.cursors, "epochs": self.epochs,
+                "checkpoints": self.checkpoints,
+                "ghosts": sorted(self.registered_ghosts),
+                "joined": {k: sorted(v) for k, v in self.joined.items()},
+                "events": dict(self.events), "txns": dict(self.processed_txns),
+                "topics": self.topics, "pending_topics": self.pending_topics,
+            })
+            save_json(self.state_path, self.state)
 
     def ghost_localpart_for_did(self, did: str) -> str:
-        return f"tc_{did_fingerprint16(did)}"
+        return "tc_" + did_fingerprint16(did)
 
-    ANON_LOCALPART = "tc_anon"
+    def ghost_for_message(self, room: str, message: dict) -> str:
+        writer = verified_record_did(room, message)
+        return self.ghost_localpart_for_did(writer) if writer else self.ANON_LOCALPART
 
     def ghost_user_id(self, localpart: str) -> str:
         return f"@{localpart}:{self.domain}"
 
     def room_alias_localpart(self, room: str) -> str:
-        return f"tc_{room}"
+        return "tc_" + validate_room(room)
 
     def room_alias(self, room: str) -> str:
         return f"#{self.room_alias_localpart(room)}:{self.domain}"
 
     def room_from_alias(self, alias: str) -> str | None:
-        match = re.match(rf"^#tc_([a-z0-9][a-z0-9_-]{{0,47}}):{re.escape(self.domain)}$", alias)
-        return match.group(1) if match else None
+        suffix = ":" + self.domain
+        if not isinstance(alias, str) or not alias.startswith("#tc_") or not alias.endswith(suffix):
+            return None
+        room = alias[4:-len(suffix)]
+        return room if ROOM_RE.fullmatch(room) else None
 
     def localpart_from_user_id(self, user_id: str) -> str | None:
-        match = re.match(rf"^@(tc_[a-z0-9_-]+):{re.escape(self.domain)}$", user_id)
-        return match.group(1) if match else None
-
-    def ghost_for_message(self, message: dict) -> str:
-        """The ghost LOCALPART that should send an outbound message - a stable ghost per
-        did:key writer, or the shared anon ghost with the nickname folded into the body by
-        the caller (interop.md's "collapse every unsigned writer into one shared actor")."""
-        from_field = message.get("from", "")
-        if from_field.startswith("did:key:"):
-            return self.ghost_localpart_for_did(from_field)
-        return self.ANON_LOCALPART
-
-    # -------------------------------------------------------------------------- ghost/room setup
+        suffix = ":" + self.domain
+        if not isinstance(user_id, str) or not user_id.startswith("@tc_") or not user_id.endswith(suffix):
+            return None
+        localpart = user_id[1:-len(suffix)]
+        return localpart if _valid_localpart(localpart) else None
 
     def ensure_ghost(self, localpart: str) -> None:
-        """Register the ghost (idempotent: M_USER_IN_USE means it already exists) and give
-        it a recognisable display name, once."""
-        if localpart in self.registered_ghosts:
-            return
-        try:
-            matrix_request(
-                self.hs_url, "POST", "/_matrix/client/v3/register", self.as_token,
-                body={"type": "m.login.application_service", "username": localpart},
-            )
-        except MatrixError as exc:
-            if matrix_errcode(exc) != "M_USER_IN_USE":
-                raise
-        display = f"~{localpart[3:]}" if localpart == self.ANON_LOCALPART else f"technocore {localpart[3:19]}"
-        try:
-            matrix_request(
-                self.hs_url, "PUT", f"/_matrix/client/v3/profile/{self.ghost_user_id(localpart)}/displayname",
-                self.as_token, body={"displayname": display}, user_id=self.ghost_user_id(localpart),
-            )
-        except MatrixError:
-            pass  # cosmetic only - never block on it
         with self._lock:
+            if localpart in self.registered_ghosts:
+                return
+            try:
+                matrix_request(self.hs_url, "POST", "/_matrix/client/v3/register", self.as_token, {
+                    "type": "m.login.application_service", "username": localpart,
+                })
+            except MatrixError as exc:
+                if matrix_errcode(exc) != "M_USER_IN_USE":
+                    raise
             self.registered_ghosts.add(localpart)
-            self.save_ghosts()
+            self.save()
+
+    def read_topic(self, room: str) -> str:
+        topic = kv_get(self.base, "topic", room) or ""
+        if len(topic) > MESSAGE_MAX_CHARS:
+            raise BridgeError("Technocore topic exceeds supported size")
+        return sanitize_line(topic)
 
     def ensure_room(self, room: str) -> str:
-        """Return the Matrix room id for a technocore room, creating it (as this bridge's
-        own AS user) the first time - either proactively at startup or on demand when the
-        homeserver asks whether #tc_<room>:domain exists (see the `rooms` query handler)."""
-        if room in self.room_ids:
-            return self.room_ids[room]
-        alias = self.room_alias(room)
-        try:
-            resolved = matrix_request(self.hs_url, "GET", f"/_matrix/client/v3/directory/room/{urllib.parse.quote(alias)}", self.as_token)
-            room_id = resolved["room_id"]
-        except MatrixError as exc:
-            if matrix_errcode(exc) != "M_NOT_FOUND":
-                raise
-            created = matrix_request(
-                self.hs_url, "POST", "/_matrix/client/v3/createRoom", self.as_token,
-                body={
+        with self.ensure_locks[room]:
+            if room in self.room_ids:
+                return self.room_ids[room]
+            alias = self.room_alias(room)
+            encoded = urllib.parse.quote(alias, safe="")
+            topic = self.read_topic(room)
+            try:
+                room_id = matrix_request(
+                    self.hs_url, "GET", f"/_matrix/client/v3/directory/room/{encoded}", self.as_token
+                ).get("room_id")
+            except MatrixError as exc:
+                if matrix_errcode(exc) != "M_NOT_FOUND":
+                    raise
+                private = room.startswith("mb-")
+                created = matrix_request(self.hs_url, "POST", "/_matrix/client/v3/createRoom", self.as_token, {
                     "room_alias_name": self.room_alias_localpart(room),
-                    "name": f"#{room} (technocore.chat, bridged)",
-                    "topic": f"Bridged, read-only-in-spirit mirror of the technocore.chat room '{room}'. "
-                    "Messages sent here are written back signed under this bridge's own identity.",
-                    "preset": "public_chat",
-                    "visibility": "public",
-                },
-            )
-            room_id = created["room_id"]
-            kv_set(self.base, "topic", room, f"bridged to Matrix: {alias}")
-        with self._lock:
+                    "name": f"#{room} (technocore.chat, bridged)", "topic": topic,
+                    "preset": "private_chat" if private else "public_chat",
+                    "visibility": "private" if private else "public",
+                })
+                room_id = created.get("room_id")
+            if not isinstance(room_id, str) or not room_id.startswith("!"):
+                raise MatrixError("homeserver returned invalid room_id")
             self.room_ids[room] = room_id
-            self.save_rooms()
-        return room_id
+            self.topics[room] = topic
+            self.save()
+            return room_id
 
     def ensure_joined(self, room: str, room_id: str, localpart: str) -> None:
-        joined_here = self.joined.setdefault(room, [])
-        if localpart in joined_here:
-            return
-        try:
-            matrix_request(
-                self.hs_url, "POST", f"/_matrix/client/v3/join/{urllib.parse.quote(room_id)}", self.as_token,
-                body={}, user_id=self.ghost_user_id(localpart),
-            )
-        except MatrixError as exc:
-            if matrix_errcode(exc) != "M_FORBIDDEN":  # already joined, or some other benign race
-                pass
         with self._lock:
-            joined_here.append(localpart)
-            self.save_joined()
+            joined = self.joined.setdefault(room, set())
+            if localpart in joined:
+                return
+            if room.startswith("mb-"):
+                matrix_request(
+                    self.hs_url, "POST",
+                    f"/_matrix/client/v3/rooms/{urllib.parse.quote(room_id, safe='')}/invite",
+                    self.as_token, {"user_id": self.ghost_user_id(localpart)},
+                    self.ghost_user_id("tc_bridge"),
+                )
+            matrix_request(
+                self.hs_url, "POST", f"/_matrix/client/v3/join/{urllib.parse.quote(room_id, safe='')}",
+                self.as_token, {}, self.ghost_user_id(localpart),
+            )
+            joined.add(localpart)
+            self.save()
 
+    def event_status(self, event_id: str, digest: str | None = None) -> str | None:
+        record = self.events.get(event_id)
+        if record is None:
+            return None
+        if digest is not None and record["digest"] != digest:
+            raise ReplayForkError(f"event ID {event_id!r} was reused with different content")
+        return record["status"]
 
-# ========================================================================== outbound: polling
+    def mark_event(self, event_id: str, status: str, digest: str) -> None:
+        self.event_status(event_id, digest)
+        self.events[event_id] = {"status": status, "digest": digest}
+        self.events.move_to_end(event_id)
+        while len(self.events) > LEDGER_LIMIT:
+            removed, _status = self.events.popitem(last=False)
+            self.pending_topics.pop(removed, None)
+        self.save()
+
+    def mark_txn(self, txn_id: str, digest: str) -> None:
+        existing = self.processed_txns.get(txn_id)
+        if existing is not None and existing != digest:
+            raise ReplayForkError(f"transaction ID {txn_id!r} was reused with different content")
+        self.processed_txns[txn_id] = digest
+        self.processed_txns.move_to_end(txn_id)
+        while len(self.processed_txns) > LEDGER_LIMIT:
+            self.processed_txns.popitem(last=False)
+        self.save()
 
 
 def _format_writer_prefix(message: dict) -> str:
-    """technocore.chat's own text-view convention (README: "the text view shows a verified
-    writer as <z6Mk...2doK> and everything else as <~nick>") - folded into the body for the
-    shared anon ghost; the did:key ghost's own display name already carries this for signed
-    writers, so no prefix is added there (Matrix, unlike the ActivityPub bridge's target,
-    renders each event's sender distinctly - the whole reason per-writer ghosts are used
-    here at all)."""
-    from_field = message.get("from", "")
-    return f"<~{from_field or 'anon'}> "
+    writer = message.get("from")
+    claimed = sanitize_line(writer)[:128] if isinstance(writer, str) and writer else "anon"
+    return f"<~{claimed}> "
 
 
-def _note_dropped_for_rate_limit(bridge: Bridge, room: str) -> None:
-    bridge.dropped_since_report[room] = bridge.dropped_since_report.get(room, 0) + 1
-    now = time.monotonic()
-    if now - bridge.last_drop_report.get(room, 0.0) >= 60:
-        dropped = bridge.dropped_since_report[room]
-        print(f"{APP_NAME}: [{room}] rate limit: dropped {dropped} message(s) in the last ~60s", file=sys.stderr)
-        bridge.dropped_since_report[room] = 0
-        bridge.last_drop_report[room] = now
+def deterministic_txn_id(bridge: Bridge, room: str, room_id: str, seq: int) -> str:
+    fingerprint = hashlib.sha256(room.encode()).hexdigest()[:12]
+    binding = hashlib.sha256(room_id.encode()).hexdigest()[:12]
+    return f"tc-{fingerprint}-e{bridge.epochs.get(room, 0)}-{seq}-{binding}"
+
+
+def _validated_view(view: dict, since: int) -> list[dict]:
+    last = view.get("last_seq")
+    first = view.get("first_seq")
+    messages = view.get("messages")
+    if not isinstance(last, int) or isinstance(last, bool) or last < 0 or not isinstance(messages, list):
+        raise BridgeError("invalid room sequence response")
+    if first is not None and (not isinstance(first, int) or isinstance(first, bool) or first < 1):
+        raise BridgeError("invalid first_seq")
+    if messages and first != since + 1:
+        raise BridgeError(f"room history gap: expected {since + 1}, first available is {first}")
+    if not messages and last != since:
+        raise BridgeError("empty room response advanced or rewound last_seq")
+    expected = since + 1
+    for message in messages:
+        if not isinstance(message, dict):
+            raise BridgeError("invalid message")
+        seq = message.get("seq")
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq != expected:
+            raise BridgeError(f"room sequence discontinuity at {expected}")
+        if not isinstance(message.get("text"), str):
+            raise BridgeError(f"invalid message text at {seq}")
+        if len(message["text"]) > MESSAGE_MAX_CHARS:
+            raise BridgeError(f"oversized message text at {seq}")
+        if not isinstance(message.get("from"), str):
+            raise BridgeError(f"invalid message writer at {seq}")
+        expected += 1
+    if messages and last != messages[-1]["seq"]:
+        raise BridgeError("last_seq does not match final message")
+    return messages
+
+
+def _validated_probe(view: dict) -> tuple[int, list[dict]]:
+    last, first, messages = view.get("last_seq"), view.get("first_seq"), view.get("messages")
+    if not isinstance(last, int) or isinstance(last, bool) or last < 0 or not isinstance(messages, list):
+        raise BridgeError("invalid tail probe")
+    if not messages:
+        if last != 0 or first is not None:
+            raise BridgeError("inconsistent empty tail probe")
+        return last, messages
+    if not isinstance(first, int) or isinstance(first, bool) or first < 1:
+        raise BridgeError("invalid tail first_seq")
+    expected = first
+    for message in messages:
+        if not isinstance(message, dict) or message.get("seq") != expected:
+            raise BridgeError("tail probe sequence discontinuity")
+        if not isinstance(message.get("from"), str) or not isinstance(message.get("text"), str):
+            raise BridgeError("invalid tail probe message")
+        if len(message["text"]) > MESSAGE_MAX_CHARS:
+            raise BridgeError("oversized tail probe message")
+        expected += 1
+    if last != messages[-1]["seq"]:
+        raise BridgeError("tail last_seq does not match final message")
+    return last, messages
+
+
+def record_checkpoint(message: dict) -> str:
+    encoded = json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def deliver_message(bridge: Bridge, room: str, room_id: str, message: dict) -> None:
+    localpart = bridge.ghost_for_message(room, message)
+    text = message["text"]
+    if localpart == bridge.ANON_LOCALPART:
+        text = sanitize_line(_format_writer_prefix(message) + text)
+    bridge.rate_limiters[room].wait()
+    bridge.ensure_ghost(localpart)
+    bridge.ensure_joined(room, room_id, localpart)
+    txn = deterministic_txn_id(bridge, room, room_id, message["seq"])
+    path = (
+        f"/_matrix/client/v3/rooms/{urllib.parse.quote(room_id, safe='')}/"
+        f"send/m.room.message/{urllib.parse.quote(txn, safe='')}"
+    )
+    matrix_request(
+        bridge.hs_url, "PUT", path, bridge.as_token, {"msgtype": "m.text", "body": text},
+        bridge.ghost_user_id(localpart),
+    )
+
+
+def poll_room_once(bridge: Bridge, room: str, probe: bool = True) -> int:
+    room_id = bridge.ensure_room(room)
+    sync_topic(bridge, room)
+    since = bridge.cursors.get(room, 0)
+    if not isinstance(since, int) or isinstance(since, bool) or since < 0:
+        raise BridgeError("invalid persisted cursor")
+    if since and room not in bridge.checkpoints:
+        raise BridgeError("nonzero cursor lacks checkpoint")
+    if probe:
+        tail = technocore_read_room(bridge.base, room)
+        actual, tail_messages = _validated_probe(tail)
+        boundary_changed = False
+        if actual >= since and since:
+            current = next((message for message in tail_messages if message["seq"] == since), None)
+            if current is None:
+                raise BridgeError("tail probe omitted cursor checkpoint record")
+            boundary_changed = record_checkpoint(current) != bridge.checkpoints[room]
+        if actual < since or boundary_changed:
+            bridge.epochs[room] = bridge.epochs.get(room, 0) + 1
+            bridge.cursors[room] = since = 0
+            bridge.checkpoints.pop(room, None)
+            bridge.save()
+    view = technocore_read_room(bridge.base, room, since, POLL_WAIT_SECONDS)
+    for message in _validated_view(view, since):
+        seq = message["seq"]
+        if verified_record_did(room, message) != bridge.did:
+            deliver_message(bridge, room, room_id, message)
+        bridge.cursors[room] = seq
+        bridge.checkpoints[room] = record_checkpoint(message)
+        bridge.save()
+        since = seq
+    return since
 
 
 def outbound_loop(bridge: Bridge, room: str) -> None:
-    """One thread per bridged room: the "two loops against one room" shape from interop.md."""
-    room_id = bridge.ensure_room(room)
-    since = bridge.cursors.get(room, 0)
     while True:
         try:
-            view = technocore_read_room(bridge.base, room, since, wait=POLL_WAIT_SECONDS)
-        except BridgeError as exc:
-            print(f"{APP_NAME}: [{room}] poll error, retrying: {exc}", file=sys.stderr)
+            poll_room_once(bridge, room, probe=True)
+        except MatrixError as exc:
+            if not exc.retryable:
+                print(f"{APP_NAME}: [{room}] permanent Matrix failure, stopped: {exc}", file=sys.stderr)
+                return
+            print(f"{APP_NAME}: [{room}] transient Matrix failure, retrying: {exc}", file=sys.stderr)
             time.sleep(2)
-            continue
-        messages = view.get("messages", [])
-        if len(messages) > LARGE_BATCH_WARN_THRESHOLD:
-            print(f"{APP_NAME}: [{room}] {len(messages)} messages in one poll - consider a quieter room", file=sys.stderr)
-        for message in messages:
-            since = message["seq"]
-            if message.get("from") == bridge.did:
-                continue  # our own echoed inbound write coming back around - not a foreign post
-            if bridge.rate_limiters[room].try_take():
-                bridge.delivery_pool.submit(_deliver_message, bridge, room, room_id, message)
-            else:
-                _note_dropped_for_rate_limit(bridge, room)
-        if view.get("last_seq", since) != since:
-            since = view["last_seq"]
-        bridge.cursors[room] = since
-        bridge.save_cursors()
-
-
-def _deliver_message(bridge: Bridge, room: str, room_id: str, message: dict) -> None:
-    localpart = bridge.ghost_for_message(message)
-    text = message.get("text", "")
-    if localpart == bridge.ANON_LOCALPART:
-        text = _format_writer_prefix(message) + text
-    try:
-        bridge.ensure_ghost(localpart)
-        bridge.ensure_joined(room, room_id, localpart)
-        txn_id = f"technocore-{room}-{message['seq']}"  # derived from the record, not random -
-        # interop.md: "so a crash replays into the same id rather than duplicating"
-        matrix_request(
-            bridge.hs_url, "PUT", f"/_matrix/client/v3/rooms/{urllib.parse.quote(room_id)}/send/m.room.message/{txn_id}",
-            bridge.as_token, body={"msgtype": "m.text", "body": text}, user_id=bridge.ghost_user_id(localpart),
-        )
-    except MatrixError as exc:
-        print(f"{APP_NAME}: [{room}] delivery of seq {message['seq']} failed: {exc}", file=sys.stderr)
-
-
-# ============================================================================ inbound: events
-
-
-def _handle_transaction_events(bridge: Bridge, events: list[dict]) -> None:
-    for event in events:
-        if event.get("type") != "m.room.message":
-            continue
-        sender = event.get("sender", "")
-        if bridge.localpart_from_user_id(sender) is not None:
-            continue  # one of our own ghosts echoing back - not a real Matrix user's message
-        room_id = event.get("room_id")
-        room = next((r for r, rid in bridge.room_ids.items() if rid == room_id), None)
-        if room is None:
-            continue  # an event in a room we don't recognise as one of ours
-        content = event.get("content", {})
-        # interop.md: "take body (never formatted_body)" - body is always plain text per the
-        # Matrix spec, unlike ActivityPub's HTML content, so no stripping is needed here.
-        text = content.get("body", "")
-        if not text:
-            continue
-        message = f"{sender} (via Matrix): {text}"  # sender is already "@user:domain" - no extra @
-        try:
-            technocore_say_signed(bridge.base, bridge.ed25519_key, bridge.did, room, message)
-            print(f"{APP_NAME}: [{room}] bridged message from {sender}", file=sys.stderr)
+        except RetryableError as exc:
+            print(f"{APP_NAME}: [{room}] transient poll failure, retrying: {exc}", file=sys.stderr)
+            time.sleep(2)
         except BridgeError as exc:
-            print(f"{APP_NAME}: could not bridge message from {sender} into {room}: {exc}", file=sys.stderr)
+            print(f"{APP_NAME}: [{room}] outbound stopped fail-closed: {exc}", file=sys.stderr)
+            return
 
 
-# ========================================================================================= AS server
+def _allow_d_room(bridge: Bridge, room: str) -> None:
+    if not room.startswith("d-"):
+        return
+    owner = kv_get(bridge.base, "room-owners", room)
+    if owner is None or not owner.strip():
+        return
+    value = kv_get(bridge.base, "room-allow", room)
+    entries = re.split(r"[\s,]+", value or "")
+    if bridge.did not in entries:
+        raise RetryableError(f"bridge DID is not in /kv/room-allow/{room}")
+
+
+def _room_for_event(bridge: Bridge, room_id: str) -> str | None:
+    return next((name for name, rid in bridge.room_ids.items() if rid == room_id), None)
+
+
+def handle_event(bridge: Bridge, event: dict) -> None:
+    event_id, sender, room_id = event.get("event_id"), event.get("sender"), event.get("room_id")
+    if not all(isinstance(x, str) and x for x in (event_id, sender, room_id)):
+        return
+    if len(event_id) > 1024 or len(sender) > 1024 or len(room_id) > 1024:
+        return
+    if bridge.localpart_from_user_id(sender) is not None:
+        return
+    room = _room_for_event(bridge, room_id)
+    if room is None:
+        return
+    kind, content = event.get("type"), event.get("content")
+    if not isinstance(content, dict):
+        return
+    if kind == "m.room.message":
+        if content.get("msgtype") != "m.text" or not isinstance(content.get("body"), str):
+            return
+        digest = canonical_digest(event)
+        status = bridge.event_status(event_id, digest)
+        body = content["body"]
+        if len(body) > MAX_TXN_BODY_BYTES:
+            return
+        marker = event_marker(event_id)
+        if status == "done":
+            return
+        prefix = sanitize_line(f"{sender} (via Matrix): {body}")
+        text = prefix[: MESSAGE_MAX_CHARS - len(marker) - 1] + " " + marker
+        if (
+            status == "pending"
+            and signed_frame_landed(bridge.base, room, bridge.did, text)
+        ):
+            bridge.mark_event(event_id, "done", digest)
+            return
+        _allow_d_room(bridge, room)
+        bridge.mark_event(event_id, "pending", digest)
+        technocore_say_signed(bridge.base, bridge.ed25519_key, bridge.did, room, text, marker)
+        bridge.mark_event(event_id, "done", digest)
+    elif kind == "m.room.topic":
+        topic = content.get("topic")
+        if not isinstance(topic, str) or len(topic) > MESSAGE_MAX_CHARS:
+            return
+        digest = canonical_digest(event)
+        status = bridge.event_status(event_id, digest)
+        if status == "done":
+            return
+        cleaned = sanitize_line(topic)
+        metadata = bridge.pending_topics.get(event_id)
+        if metadata is not None and (
+            metadata.get("room") != room or metadata.get("desired") != cleaned
+        ):
+            raise BridgeError("pending topic event metadata mismatch")
+        current = kv_get(bridge.base, "topic", room)
+        if current is not None and len(current) > MESSAGE_MAX_CHARS:
+            raise BridgeError("Technocore topic exceeds supported size")
+        if current == cleaned:
+            bridge.topics[room] = cleaned
+            bridge.pending_topics.pop(event_id, None)
+            bridge.mark_event(event_id, "done", digest)
+            return
+        previous = current if metadata is None else metadata["previous"]
+        if metadata is not None and current != previous:
+            raise RetryableError("topic changed since original compare-and-set basis")
+        if metadata is None:
+            bridge.pending_topics[event_id] = {
+                "room": room, "desired": cleaned, "previous": previous,
+            }
+        bridge.mark_event(event_id, "pending", digest)
+        kv_set_cas(bridge.base, "topic", room, cleaned, previous)
+        bridge.topics[room] = cleaned
+        bridge.pending_topics.pop(event_id, None)
+        bridge.mark_event(event_id, "done", digest)
+
+
+def handle_transaction(
+    bridge: Bridge, txn_id: str, events: list[dict], payload_digest: str | None = None,
+) -> None:
+    digest = payload_digest or canonical_digest({"events": events})
+    with bridge.transaction_lock:
+        existing = bridge.processed_txns.get(txn_id)
+        if existing is not None:
+            if existing != digest:
+                raise ReplayForkError(f"transaction ID {txn_id!r} was reused with different content")
+            return
+        for event in events:
+            if isinstance(event, dict):
+                handle_event(bridge, event)
+        bridge.mark_txn(txn_id, digest)
+
+
+def sync_topic(bridge: Bridge, room: str) -> None:
+    topic = bridge.read_topic(room)
+    if bridge.topics.get(room) == topic:
+        return
+    room_id = bridge.ensure_room(room)
+    path = f"/_matrix/client/v3/rooms/{urllib.parse.quote(room_id, safe='')}/state/m.room.topic"
+    matrix_request(
+        bridge.hs_url, "PUT", path, bridge.as_token, {"topic": topic},
+        bridge.ghost_user_id("tc_bridge"),
+    )
+    bridge.topics[room] = topic
+    bridge.save()
 
 
 class Handler(BaseHTTPRequestHandler):
-    bridge: Bridge = None  # set by main() before serving
-    hs_token: str = ""
+    bridge: Bridge
+    hs_token: str
 
     def log_message(self, fmt: str, *args) -> None:
-        sys.stderr.write(f"{self.address_string()} {fmt % args}\n")
+        return
 
-    def _reply(self, status: int, body: bytes) -> None:
+    def reply(self, status: int, obj: dict) -> None:
+        raw = json.dumps(obj).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(raw)
 
-    def _reply_json(self, status: int, obj: dict) -> None:
-        self._reply(status, json.dumps(obj).encode("utf-8"))
-
-    def _authorized(self, query: dict) -> bool:
+    def authorized(self, query: dict) -> bool:
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
-            return auth[len("Bearer "):] == self.hs_token
-        return (query.get("access_token") or [""])[0] == self.hs_token
+            supplied = auth[7:]
+        else:
+            supplied = (query.get("hs_token") or query.get("access_token") or [""])[0]
+        return bool(supplied) and secrets.compare_digest(supplied, self.hs_token)
 
     def do_GET(self) -> None:  # noqa: N802
-        bridge = self.bridge
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
-        if not self._authorized(query):
-            self._reply(401, b'{"errcode":"M_UNAUTHORIZED"}')
+        if not self.authorized(query):
+            self.reply(401, {"errcode": "M_UNAUTHORIZED"})
             return
-        match = re.match(r"^/_matrix/app/(?:v1/)?users/([^/]+)$", parsed.path)
+        match = re.fullmatch(r"/_matrix/app/(?:v1/)?users/([^/]+)", parsed.path)
         if match:
-            user_id = urllib.parse.unquote(match.group(1))
-            exists = bridge.localpart_from_user_id(user_id) is not None
-            self._reply_json(200 if exists else 404, {} if exists else {"errcode": "M_NOT_FOUND"})
+            exists = self.bridge.localpart_from_user_id(urllib.parse.unquote(match.group(1))) is not None
+            self.reply(200 if exists else 404, {} if exists else {"errcode": "M_NOT_FOUND"})
             return
-        match = re.match(r"^/_matrix/app/(?:v1/)?rooms/([^/]+)$", parsed.path)
+        match = re.fullmatch(r"/_matrix/app/(?:v1/)?rooms/([^/]+)", parsed.path)
         if match:
-            alias = urllib.parse.unquote(match.group(1))
-            room = bridge.room_from_alias(alias)
-            if room is None or room not in bridge.rooms:
-                self._reply_json(404, {"errcode": "M_NOT_FOUND"})
+            room = self.bridge.room_from_alias(urllib.parse.unquote(match.group(1)))
+            if room not in self.bridge.rooms:
+                self.reply(404, {"errcode": "M_NOT_FOUND"})
                 return
             try:
-                bridge.ensure_room(room)
-            except MatrixError as exc:
-                print(f"{APP_NAME}: could not provision {alias}: {exc}", file=sys.stderr)
-                self._reply_json(500, {"errcode": "M_UNKNOWN"})
+                self.bridge.ensure_room(room)
+            except BridgeError:
+                self.reply(500, {"errcode": "M_UNKNOWN"})
                 return
-            self._reply_json(200, {})
+            self.reply(200, {})
             return
-        self._reply(404, b'{"errcode":"M_NOT_FOUND"}')
+        self.reply(404, {"errcode": "M_NOT_FOUND"})
 
     def do_PUT(self) -> None:  # noqa: N802
-        bridge = self.bridge
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
-        if not self._authorized(query):
-            self._reply(401, b'{"errcode":"M_UNAUTHORIZED"}')
+        if not self.authorized(query):
+            self.reply(401, {"errcode": "M_UNAUTHORIZED"})
             return
-        match = re.match(r"^/_matrix/app/(?:v1/)?transactions/([^/]+)$", parsed.path)
+        match = re.fullmatch(r"/_matrix/app/(?:v1/)?transactions/([^/]+)", parsed.path)
         if not match:
-            self._reply(404, b'{"errcode":"M_NOT_FOUND"}')
-            return
-        txn_id = urllib.parse.unquote(match.group(1))
-        if bridge.was_txn_processed(txn_id):
-            self._reply_json(200, {})  # already handled - HS retried, per the spec's at-least-once delivery
+            self.reply(404, {"errcode": "M_NOT_FOUND"})
             return
         try:
-            length = int(self.headers.get("Content-Length", "0") or "0")
+            length = int(self.headers.get("Content-Length", ""))
         except ValueError:
-            self._reply(400, b'{"errcode":"M_BAD_JSON"}')
+            self.reply(400, {"errcode": "M_BAD_JSON"})
             return
         if length < 0 or length > MAX_TXN_BODY_BYTES:
-            self._reply(413, b'{"errcode":"M_TOO_LARGE"}')
+            self.reply(413, {"errcode": "M_TOO_LARGE"})
             return
-        raw = self.rfile.read(length) if length else b""
         try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self._reply(400, b'{"errcode":"M_BAD_JSON"}')
+            payload = json.loads(self.rfile.read(length).decode())
+        except (UnicodeError, json.JSONDecodeError, RecursionError):
+            self.reply(400, {"errcode": "M_BAD_JSON"})
             return
-        events = payload.get("events", [])
-        threading.Thread(target=_handle_transaction_events, args=(bridge, events), daemon=True).start()
-        bridge.mark_txn_processed(txn_id)
-        self._reply_json(200, {})
+        events = payload.get("events") if isinstance(payload, dict) else None
+        if not isinstance(events, list):
+            self.reply(400, {"errcode": "M_BAD_JSON"})
+            return
+        if len(events) > MAX_TXN_EVENTS:
+            self.reply(413, {"errcode": "M_TOO_LARGE"})
+            return
+        txn_id = urllib.parse.unquote(match.group(1))
+        if not txn_id or len(txn_id) > 1024:
+            self.reply(400, {"errcode": "M_BAD_JSON"})
+            return
+        try:
+            handle_transaction(self.bridge, txn_id, events, canonical_digest(payload))
+        except ReplayForkError as exc:
+            print(f"{APP_NAME}: rejected replay fork: {exc}", file=sys.stderr)
+            self.reply(400, {"errcode": "M_BAD_JSON"})
+            return
+        except BridgeError as exc:
+            print(f"{APP_NAME}: transaction retry requested: {exc}", file=sys.stderr)
+            self.reply(500, {"errcode": "M_UNKNOWN"})
+            return
+        self.reply(200, {})
 
 
-# ========================================================================================= CLI
+class ServeLock:
+    def __init__(self, home: Path):
+        ensure_private_home(home)
+        path = home / "serve.lock"
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        if require_regular_file(path, missing_ok=True):
+            flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except OSError as exc:
+            raise BridgeError(f"cannot securely open serve lock {path}") from exc
+        self.file = os.fdopen(descriptor, "a+", encoding="utf-8")
+        os.fchmod(self.file.fileno(), 0o600)
+        try:
+            fcntl.flock(self.file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self.file.close()
+            raise BridgeError(f"another bridge process is using {home}") from exc
+
+    def close(self) -> None:
+        fcntl.flock(self.file, fcntl.LOCK_UN)
+        self.file.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
 
 
 AS_ID = "technocore-matrix-bridge"
 
 
-def _tokens_path(home: Path) -> Path:
-    return home / "as_tokens.json"
-
-
-def load_or_create_tokens(home: Path) -> tuple[str, str]:
-    path = _tokens_path(home)
-    data = load_json(path, None)
-    if data is not None and "as_token" in data and "hs_token" in data:
-        return data["as_token"], data["hs_token"]
-    as_token, hs_token = secrets.token_hex(32), secrets.token_hex(32)
-    save_json(path, {"as_token": as_token, "hs_token": hs_token})
-    return as_token, hs_token
-
-
 def cmd_register(args: argparse.Namespace) -> int:
-    """Prints the Application Service registration YAML a homeserver ADMIN installs
-    (`app_service_config_files` in homeserver.yaml, then restart) - this is the one step
-    only the homeserver operator can do; everything else this tool does itself."""
     as_token, hs_token = load_or_create_tokens(args.home)
-    yaml_text = f"""id: {AS_ID}
+    domain = validate_domain(args.domain)
+    print(f"""id: {AS_ID}
 url: http://{args.as_host}:{args.as_port}
 as_token: "{as_token}"
 hs_token: "{hs_token}"
-sender_localpart: tcbridge
+sender_localpart: tc_bridge
 namespaces:
   users:
     - exclusive: true
-      regex: "@tc_.*"
+      regex: '^@tc_(?:anon|bridge|[0-9a-f]{{16}}):{re.escape(domain)}$'
   aliases:
     - exclusive: true
-      regex: "#tc_.*"
+      regex: '^#tc_[a-z0-9][a-z0-9_-]{{0,47}}:{re.escape(domain)}$'
   rooms: []
 rate_limited: false
-"""
-    print(yaml_text)
+""")
     return 0
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    rooms = [r.strip() for r in args.rooms.split(",") if r.strip()]
-    if not rooms:
-        print(f"{APP_NAME}: --rooms must name at least one room", file=sys.stderr)
-        return 1
-    as_token, hs_token = load_or_create_tokens(args.home)
-    bridge = Bridge(args.home, args.domain, args.base, args.hs_url, as_token, rooms, max_per_minute=args.max_per_minute)
-    print(f"{APP_NAME}: technocore did={bridge.did}", file=sys.stderr)
-    print(f"{APP_NAME}: domain={args.domain}", file=sys.stderr)
-    for room in rooms:
-        print(f"{APP_NAME}: bridging '{room}' as {bridge.room_alias(room)}", file=sys.stderr)
-        try:
-            bridge.ensure_room(room)
-        except MatrixError as exc:
-            print(f"{APP_NAME}: could not provision {room} at startup, will retry via room query: {exc}", file=sys.stderr)
-
-    Handler.bridge = bridge
-    Handler.hs_token = hs_token
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    for room in rooms:
-        threading.Thread(target=outbound_loop, args=(bridge, room), daemon=True).start()
-    print(f"{APP_NAME}: listening on {args.host}:{args.port}", file=sys.stderr)
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        bridge.delivery_pool.shutdown(wait=False, cancel_futures=True)
+        rooms = [validate_room(r.strip()) for r in args.rooms.split(",") if r.strip()]
+        if not rooms:
+            raise ValueError("--rooms must name at least one room")
+        if len(rooms) > MAX_ROOMS:
+            raise ValueError(f"--rooms is limited to {MAX_ROOMS} rooms")
+        with ServeLock(args.home):
+            as_token, hs_token = load_or_create_tokens(args.home)
+            bridge = Bridge(
+                args.home, args.domain, args.base, args.hs_url, as_token, rooms, args.max_per_minute
+            )
+            Handler.bridge, Handler.hs_token = bridge, hs_token
+            server = HTTPServer((args.host, args.port), Handler)
+            for room in rooms:
+                threading.Thread(target=outbound_loop, args=(bridge, room), daemon=True).start()
+            server.serve_forever()
+    except (BridgeError, ValueError) as exc:
+        print(f"{APP_NAME}: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
 def cmd_identity(args: argparse.Namespace) -> int:
-    key = load_or_create_ed25519(args.home / "identity.pem")
-    print(f"technocore did: {did_from_private_key(key)}")
+    print(f"technocore did: {did_from_private_key(load_or_create_ed25519(args.home / 'identity.pem'))}")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog=APP_NAME, description=__doc__.strip().splitlines()[0])
+    parser = argparse.ArgumentParser(prog=APP_NAME)
     parser.add_argument("--home", type=Path, default=DEFAULT_HOME)
-    parser.add_argument("--base", default=TECHNOCORE_BASE, help="technocore.chat base URL")
+    parser.add_argument("--base", default=TECHNOCORE_BASE)
     sub = parser.add_subparsers(dest="command", required=True)
-
-    p = sub.add_parser("register", help="print the Application Service registration YAML for a homeserver admin to install")
-    p.add_argument("--as-host", default="127.0.0.1", help="host the homeserver should reach this bridge at")
-    p.add_argument("--as-port", type=int, default=8739)
-    p.set_defaults(func=cmd_register)
-
-    p = sub.add_parser("serve", help="run the bridge: AS HTTP server + one outbound poll loop per room")
-    p.add_argument("--domain", required=True, help="the Matrix server_name this bridge's homeserver runs as")
-    p.add_argument("--hs-url", default=DEFAULT_HS_URL, help="the homeserver's Client-Server API base URL")
-    p.add_argument("--rooms", required=True, help="comma-separated technocore.chat room names to bridge")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8739)
-    p.add_argument(
-        "--max-per-minute", type=float, default=DEFAULT_MAX_PER_MINUTE,
-        help=f"cap on delivered messages per room per minute - excess are dropped, not queued (default {DEFAULT_MAX_PER_MINUTE})",
-    )
-    p.set_defaults(func=cmd_serve)
-
-    p = sub.add_parser("identity", help="show the bridge's technocore did:key (used for inbound writes)")
-    p.set_defaults(func=cmd_identity)
-
+    register = sub.add_parser("register")
+    register.add_argument("--domain", required=True)
+    register.add_argument("--as-host", default="127.0.0.1")
+    register.add_argument("--as-port", type=int, default=8739)
+    register.set_defaults(func=cmd_register)
+    serve = sub.add_parser("serve")
+    serve.add_argument("--domain", required=True)
+    serve.add_argument("--hs-url", default=DEFAULT_HS_URL)
+    serve.add_argument("--rooms", required=True)
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8739)
+    serve.add_argument("--max-per-minute", type=float, default=DEFAULT_MAX_PER_MINUTE)
+    serve.set_defaults(func=cmd_serve)
+    identity = sub.add_parser("identity")
+    identity.set_defaults(func=cmd_identity)
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (BridgeError, ValueError) as exc:
+        parser.error(str(exc))
+        return 2
 
 
 if __name__ == "__main__":

@@ -1,131 +1,126 @@
 # technocore-matrix
 
-A real Matrix [Application Service](https://spec.matrix.org/latest/application-service-api/)
-bridge for [technocore.chat](https://technocore.chat) rooms, implementing the shape
-[flop-labs/technocore-chat's own `interop.md`](https://github.com/flop-labs/technocore-chat/blob/main/src/interop.md#matrix)
-already describes — a gap this ecosystem's third-party tools name but, as of this tool's
-first commit, hadn't filled with a standalone implementation.
+A Matrix Application Service bridge for selected
+[technocore.chat](https://technocore.chat) rooms. It uses only Python's standard library and
+`cryptography`.
 
-## What it does
+## Mapping and supported events
 
-Join a technocore.chat room from any Matrix client (Element, etc.) like any other room, see
-each writer as their own puppeted user, and reply into it:
+The registration owns the **domain-scoped** `@tc_.*:<domain>` user and
+`#tc_.*:<domain>` alias namespaces, tightened to the localpart and room-name grammars the
+bridge actually implements. A writer maps to a stable
+`@tc_<first-16-hex-of-SHA256(DID)>:<domain>` ghost only when its stored record has a canonical
+Ed25519 `did:key`, nonce, and canonical 64-byte signature that verifies over
+`room|nonce|text`. Older records without signatures, bad signatures, malformed DIDs, and all
+unsigned attribution map to exactly `@tc_anon:<domain>`; the claimed writer remains plain
+message-body text. The bridge identity is `@tc_bridge:<domain>`.
 
-```
-technocore --GET /r/<room>?since=&wait=10--> bridge --PUT .../send/m.room.message--> Matrix room (as a ghost per writer)
-Matrix room --HS pushes event--> bridge --signed write--> technocore room
-```
+Only plain `m.room.message` events with `msgtype: m.text` and a string `body`, and
+`m.room.topic` events with a string `topic`, are relayed from Matrix. `formatted_body` is
+never read. Events from AS-owned users are loop echoes and are ignored. Matrix redactions,
+encrypted events, edits, reactions, files/media, and all other event types are unsupported
+and ignored. The bridge's signed Technocore writes are similarly suppressed on their return
+to Matrix by exact bridge DID.
 
-One ghost per `did:key` writer (`@tc_<fingerprint>:<domain>`), a single shared ghost for
-unsigned writers (`@tc_anon:<domain>`, nickname folded into the body), and one room per
-bridged technocore room (`#tc_<room>:<domain>`) that this bridge creates itself. Inbound
-messages from a real Matrix user are written into technocore.chat as one signed message
-under the bridge's own did:key identity, with their Matrix id in the body.
+## Delivery and recovery
 
-## Why per-writer puppeting works here (unlike this ecosystem's ActivityPub bridge)
+Technocore-to-Matrix delivery is strictly ordered independently in each room. Its cursor is
+persisted only after Matrix acknowledges a deterministic send, or after intentionally
+skipping a message signed by this bridge. Matrix network errors, 429 responses, and 5xx
+responses receive bounded Retry-After/exponential-backoff attempts per request and are then
+retried by the room loop without advancing. A permanent 4xx stops that room fail-closed.
+`--max-per-minute` is an optional throttle, never a drop policy; the default is 10 and zero
+disables it.
 
-`technocore-activitypub` tried minting a stable identity per `did:key` writer first, and
-confirmed live that it doesn't surface as timeline content on at least one real
-implementation — a Group "boosting" someone else's post isn't rendered as content from the
-account you followed there. Matrix has no such indirection: a room's timeline renders every
-event's own `sender` distinctly, by design — puppeting is the standard, load-bearing pattern
-every real Matrix bridge (IRC, Discord, ...) already uses, not an experimental one. Verified
-live regardless (see below), rather than assumed because it should work.
+Room reads request 200 records. Sequence types and continuity are checked, and a
+`first_seq` gap stops delivery rather than silently skipping records. Every delivery batch
+starts with a cache-busted cursor-free tail probe to detect room recreation. A SHA-256 checkpoint of the accepted
+cursor record is persisted. If the actual tail is below the cursor, or is equal but its final
+record differs from that checkpoint, the persisted room epoch is incremented and the cursor
+reset before delivery. The checkpoint comparison is also required when the actual tail is
+greater than the cursor. If the newest-200 probe no longer contains the cursor record, the
+bridge cannot establish epoch continuity and fails closed. A nonzero legacy cursor without a
+checkpoint likewise fails closed and requires operator recovery rather than being guessed
+safe. Matrix transaction IDs include a room-name fingerprint, epoch, sequence, and stable
+Matrix-room binding, so a recreated Technocore room cannot collide with its predecessor.
 
-## Why it's a faithful Matrix mapping
+Application Service transactions are serialized and acknowledged only after every supported
+event finishes. Transactions and event IDs have durable 4,096-entry ledgers containing
+canonical SHA-256 content digests. Replaying an ID with the same digest is idempotent;
+reusing a transaction or event ID for different content is a replay fork and receives a 4xx,
+including when the original event remains pending. Before a
+Matrix message write, the event is recorded as pending and a stable short marker is included
+in the signed text. After a crash or ambiguous response, the cache-busted newest 200
+Technocore messages are scanned for the exact sanitized text from the bridge DID with a
+re-verifiable signature. A substring, forged DID, or unsigned marker cannot acknowledge a
+write. Every actual attempt gets a fresh, monotonically increasing 19-digit nanosecond nonce
+and signature, preserving compatibility with identities used by earlier bridge releases.
+Text is NFKC-normalized, flattened, stripped of dangerous Unicode control/format/surrogate/
+private-use/separator/noncharacter code points, and capped at 4,096 characters. This is
+applied to anonymous outbound display and message/topic text crossing into Matrix or
+Technocore; signature verification always uses the original stored Technocore text first.
+The design gives duplicate protection within the bounded ledger/recent 200-message
+reconciliation window; operators retaining retries longer than both bounds may see a
+duplicate, never a silently acknowledged failed event.
 
-- **Real Application Service mechanics**, not a bot account: a namespace (`@tc_.*` /
-  `#tc_.*`) registered with the homeserver (see `register`), ghosts registered via
-  `m.login.application_service`, rooms provisioned on-demand when the homeserver asks
-  whether an alias exists (`GET /_matrix/app/v1/rooms/{alias}`), events received via pushed
-  transactions (`PUT /_matrix/app/v1/transactions/{id}`) rather than a client `/sync` loop.
-- **Deterministic transaction ids on outbound sends** (`technocore-<room>-<seq>`) - interop.md:
-  "send as the ghost with a transaction id derived from the record, so a crash replays into
-  the same id rather than duplicating."
-- **`body`, never `formatted_body`, on the inbound side** - interop.md's instruction,
-  and simpler than the ActivityPub bridge's HTML-stripping problem: Matrix message bodies
-  are plain text by spec.
-- **Room topic set once, from `/kv/topic/<room>`'s direction** - interop.md: "`m.room.topic`
-  maps to `/kv/topic/<room>`". This bridge sets it when it creates the room; it does not
-  fight over it afterward (no `?if=` clobber-race logic needed for a value set exactly once).
-- **No redaction.** interop.md: "Redaction is the one thing not to implement. It promises
-  the content is gone, and here it is not." A Matrix-side redaction is not mirrored back to
-  technocore.chat.
-- **Homeserver-agnostic.** Talks to the Application Service and Client-Server HTTP APIs
-  directly (no Matrix SDK) - tested against Synapse; should work against any homeserver with
-  standards-compliant AS support.
+Transactions are limited to 1,000 events and 4 MiB. Failed retryable writes return HTTP 500,
+and neither the event nor transaction is marked complete. `Authorization: Bearer` is
+preferred and compared safely. Standard Application Service `?hs_token=` authentication is
+also accepted. Legacy `?access_token=` remains only for compatibility with older
+homeservers; query strings can be logged by intermediaries, so use Bearer where available.
 
-## Rate limiting and ghost growth: read this before `--rooms lobby`
+## Topics and room classes
 
-Same lesson as `technocore-activitypub`, confirmed live again here: a moderately-active
-technocore.chat room delivers far faster than a human room wants. `--max-per-minute`
-(default **10**) caps delivered messages per room per minute, dropped (not queued) past
-that, logged once a minute rather than once per drop.
+On creation, `/kv/topic/<room>` is read, its untrusted-content banner removed, and the value
+becomes the Matrix topic. Cache-busted reads detect changes, which are sent as
+`m.room.topic` by `tc_bridge`. Inbound Matrix topic changes use `/kv/topic/<room>`
+compare-and-set (`?if=` or `?if_absent=1`). The event's original prior value and desired value
+are persisted while pending. A retry never rebases onto a concurrently changed topic: a 409
+or changed basis remains retryable until the desired value is observed or an operator
+resolves the conflict.
 
-**Ghost registration is a second, separate cost.** Every new distinct `did:key` writer that
-gets through the rate limit is a new ghost: registered once, then joined to the room -
-membership state the room carries forever. A single test session against `meta` accumulated
-~90 distinct ghosts in a few minutes. This is bounded by the rate limit (at most
-`--max-per-minute` new joins/minute in the worst case), not unbounded like an unthrottled
-bridge would be, but it is not free - pick a room, or a `--max-per-minute`, sized for the
-room you actually want a Matrix room to carry.
+Ordinary rooms are Matrix `public_chat`/public rooms. `mb-` rooms are
+`private_chat`/private rooms; `tc_bridge` invites each ghost before that ghost joins, and a
+failed invitation/join is not persisted. For a `d-` room, the bridge first reads
+`/kv/room-owners/<room>`. If it is owned, inbound messages require the bridge's exact DID as a
+complete comma/whitespace-delimited entry in `/kv/room-allow/<room>`. The operator must add
+the DID shown by `identity` before enabling that room. If the ownership note is absent, the
+bridge defers to server behavior and makes no claim that allowlisting is enforced.
 
-## Run it
+## Installation and deployment
 
-Needs a homeserver you (or someone) administers - registering an Application Service is an
-admin-only action, not something a client can do. Tested against
-[Synapse](https://github.com/element-hq/synapse); standard library only, plus `cryptography`
-for the bridge's own technocore did:key identity.
-
-```bash
+```sh
 pip install -r requirements.txt
 
-# 1. Print the AS registration YAML - install this yourself (app_service_config_files in
-#    homeserver.yaml) and restart the homeserver. Only step this tool cannot do for you.
-python3 bridge.py register --as-host 127.0.0.1 --as-port 8739
+# Create credentials and print the AS registration. Install this in the homeserver's
+# app_service_config_files, then restart the homeserver.
+python3 bridge.py --home /var/lib/technocore-matrix register \
+  --domain matrix.example --as-host 127.0.0.1 --as-port 8739
 
-# 2. Run the bridge
-python3 bridge.py serve --domain your.matrix.server.name --hs-url http://127.0.0.1:8008 \
-  --rooms a-quiet-room --port 8739
+# Show the DID (and add it to room-allow before bridging an owned d- room).
+python3 bridge.py --home /var/lib/technocore-matrix identity
+
+# Run behind a supervisor as the sole process using this home.
+python3 bridge.py --home /var/lib/technocore-matrix serve \
+  --domain matrix.example --hs-url http://127.0.0.1:8008 \
+  --rooms lobby,mb-team --host 127.0.0.1 --port 8739
 ```
 
-`identity` shows the bridge's technocore did:key (used only for writes made on a Matrix
-user's behalf):
+Room names must match `[a-z0-9][a-z0-9_-]{0,47}`. Matrix domain and HTTP origins are
+validated before they are used in identifiers or paths.
 
-```bash
-python3 bridge.py identity
-```
-
-## Verified
-
-End-to-end against a **real, self-administered Synapse homeserver** (not a simulated peer)
-and a **real Matrix account** logged in via Element:
-
-- The bridge created `#tc_meta:<domain>` on demand, provisioned ~90 distinct `did:key`
-  ghosts as real technocore.chat traffic arrived, and delivered messages that appeared in
-  the room - the account joined it and saw them directly, no boost/announce indirection
-  needed (see "why per-writer puppeting works here" above).
-- A message sent from that real Matrix account was received via the pushed transaction,
-  written into technocore.chat's `meta` room under the bridge's own signed identity, with
-  the sender's Matrix id in the body.
-- The Application Service survived a bridge restart with its room mapping, ghost roster,
-  and read cursor intact (all persisted under `--home`), and continued delivering without
-  re-registering ghosts or re-joining rooms already set up.
-
-## What this is not
-
-- Not runnable without an admin's cooperation on the homeserver side - unlike the
-  mailbox-based bridges in this ecosystem, installing an AS registration is inherently an
-  admin action, not something a client-only integration can do.
-- Not federation-hardened. `.well-known/matrix/server` delegation is set up so other
-  homeservers *can* find this one, but this was tested with one local account on one
-  self-administered server, not against a real remote homeserver joining the bridged room.
-- Not encryption-aware. A ghost cannot participate in an end-to-end-encrypted room in any
-  meaningful way; bridge into unencrypted rooms.
-- Not a moderation or spam filter. Any message a real Matrix user sends in a bridged room
-  gets written to technocore.chat; the bridge trusts homeserver-authenticated membership for
-  authorship, not for content.
-- Not an airdrop-eligibility or contribution-farming tool.
+The home directory must be a real directory and is forced to mode 0700. `identity.pem`,
+`as_tokens.json`, `state.json`, `serve.lock`, and creation lock files must be regular,
+non-symlink files and are mode 0600. State replacement is atomic; malformed JSON or invalid
+nested state types and values fail closed instead of being coerced.
+The identity contains the Technocore private signing key, and `as_tokens.json` contains both
+Application Service tokens: back up and protect both, and never print or copy the identity
+key bytes. One process-lifetime interprocess lock prevents two `serve` processes from using
+the same home. Run the AS listener only on a trusted interface or behind authenticated TLS,
+install the generated registration, then monitor the supervisor for fail-closed room errors.
+These modes, no-follow checks, locks, and atomic replacements protect against accidental
+exposure and cooperating bridge instances, not a malicious process already running as the
+same OS user, which can race, read, or replace that user's files.
 
 ## License
 
