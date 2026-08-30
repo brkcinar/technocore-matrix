@@ -42,6 +42,7 @@ MULTICODEC_ED25519 = b"\xed\x01"
 MESSAGE_MAX_CHARS = 4096
 MAX_TXN_BODY_BYTES = 4_194_304
 MAX_TXN_EVENTS = 1000
+MAX_JSON_DEPTH = 64
 MAX_ROOMS = 256
 LEDGER_LIMIT = 4096
 POLL_WAIT_SECONDS = 10
@@ -59,6 +60,10 @@ class RetryableError(BridgeError):
 
 class ReplayForkError(BridgeError):
     """A durable identifier was reused for different content."""
+
+
+class InvalidTransactionError(BridgeError):
+    """A malformed Application Service transaction that must not be retried."""
 
 
 class MatrixError(BridgeError):
@@ -304,7 +309,10 @@ def _http_json(request: urllib.request.Request, timeout: float = 15, attempts: i
             last = exc
             if attempt + 1 < attempts:
                 time.sleep(_retry_after(exc, attempt))
-        except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError) as exc:
+        except (
+            urllib.error.URLError, OSError, TimeoutError, UnicodeError,
+            json.JSONDecodeError, RecursionError,
+        ) as exc:
             last = exc
             if attempt + 1 < attempts:
                 time.sleep(min(0.25 * (2**attempt), 4))
@@ -361,7 +369,7 @@ def technocore_read_room(base: str, room: str, since: int | None = None, wait: i
         value = json.loads(technocore_get(base, f"/r/{room}", params, wait + 15).decode())
     except urllib.error.HTTPError as exc:
         raise BridgeError(f"room read permanently failed: HTTP {exc.code}") from exc
-    except (json.JSONDecodeError, UnicodeError) as exc:
+    except (json.JSONDecodeError, RecursionError, UnicodeError) as exc:
         raise BridgeError("malformed technocore room response") from exc
     if not isinstance(value, dict):
         raise BridgeError("malformed technocore room response")
@@ -383,6 +391,8 @@ def kv_get(base: str, namespace: str, key: str) -> str | None:
         if exc.code == 404:
             return None
         raise RetryableError(f"note read failed: HTTP {exc.code}") from exc
+    except UnicodeError as exc:
+        raise RetryableError("malformed technocore note response") from exc
 
 
 def kv_set_cas(base: str, namespace: str, key: str, value: str, previous: str | None) -> None:
@@ -412,13 +422,33 @@ def sanitize_line(text: str) -> str:
     return " ".join("".join(cleaned).split())[:MESSAGE_MAX_CHARS]
 
 
+def utf8_safe(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeError:
+        return False
+    return True
+
+
+def validate_json_depth(value: object) -> None:
+    stack = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > MAX_JSON_DEPTH:
+            raise InvalidTransactionError("transaction JSON is too deeply nested")
+        if isinstance(current, dict):
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current)
+
+
 def canonical_digest(value: object) -> str:
     try:
         encoded = json.dumps(
             value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
         ).encode()
-    except (TypeError, ValueError) as exc:
-        raise BridgeError("value cannot be canonically encoded") from exc
+    except (RecursionError, TypeError, UnicodeError, ValueError) as exc:
+        raise InvalidTransactionError("transaction cannot be canonically encoded") from exc
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -947,6 +977,8 @@ def handle_event(bridge: Bridge, event: dict) -> None:
         return
     if len(event_id) > 1024 or len(sender) > 1024 or len(room_id) > 1024:
         return
+    if not all(utf8_safe(value) for value in (event_id, sender, room_id)):
+        raise InvalidTransactionError("Matrix identifiers must be valid Unicode scalar text")
     if bridge.localpart_from_user_id(sender) is not None:
         return
     room = _room_for_event(bridge, room_id)
@@ -1113,8 +1145,11 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(413, {"errcode": "M_TOO_LARGE"})
             return
         try:
-            payload = json.loads(self.rfile.read(length).decode())
-        except (UnicodeError, json.JSONDecodeError, RecursionError):
+            payload = json.loads(
+                self.rfile.read(length).decode(),
+                parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+            )
+        except (UnicodeError, ValueError, RecursionError):
             self.reply(400, {"errcode": "M_BAD_JSON"})
             return
         events = payload.get("events") if isinstance(payload, dict) else None
@@ -1129,7 +1164,12 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(400, {"errcode": "M_BAD_JSON"})
             return
         try:
+            validate_json_depth(payload)
             handle_transaction(self.bridge, txn_id, events, canonical_digest(payload))
+        except InvalidTransactionError as exc:
+            print(f"{APP_NAME}: rejected invalid transaction: {exc}", file=sys.stderr)
+            self.reply(400, {"errcode": "M_BAD_JSON"})
+            return
         except ReplayForkError as exc:
             print(f"{APP_NAME}: rejected replay fork: {exc}", file=sys.stderr)
             self.reply(400, {"errcode": "M_BAD_JSON"})

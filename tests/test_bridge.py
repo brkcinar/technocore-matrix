@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -424,6 +425,46 @@ class BridgeTest(unittest.TestCase):
         self.assertFalse(bridge.Handler.authorized(Request("Bearer wrong"), {}))
         self.assertFalse(bridge.Handler.authorized(Request(), {}))
 
+    def test_application_service_rejects_surrogate_ids_and_deep_json(self):
+        instance = self.make_bridge()
+        bridge.Handler.bridge = instance
+        bridge.Handler.hs_token = "correct"
+        server = bridge.HTTPServer(("127.0.0.1", 0), bridge.Handler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+
+        def put(txn_id, payload):
+            raw = json.dumps(payload).encode()
+            request = bridge.urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/_matrix/app/v1/transactions/{txn_id}"
+                "?hs_token=correct",
+                data=raw,
+                method="PUT",
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(bridge.urllib.error.HTTPError) as raised:
+                bridge.urllib.request.urlopen(request, timeout=2)
+            self.assertEqual(raised.exception.code, 400)
+
+        try:
+            put("surrogate", {
+                "events": [{
+                    "event_id": json.loads('"\\ud800"'),
+                    "sender": "@alice:matrix.example",
+                    "room_id": "!room:matrix.example",
+                    "type": "m.room.message",
+                    "content": {"msgtype": "m.text", "body": "hello"},
+                }],
+            })
+            nested = None
+            for _ in range(bridge.MAX_JSON_DEPTH + 2):
+                nested = [nested]
+            put("deep", {"events": [], "extra": nested})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_unicode_controls_do_not_survive_sanitizing(self):
         dangerous = (
             "A\u202eB\u2066C\u200bD\u0085E\ue000F"
@@ -475,6 +516,13 @@ class BridgeTest(unittest.TestCase):
                 "https://technocore.chat", "lobby", self.did, surrogate
             )
         )
+
+    @mock.patch.object(bridge, "technocore_get", return_value=b"\xff")
+    def test_invalid_technocore_utf8_is_a_controlled_error(self, _get):
+        with self.assertRaisesRegex(bridge.BridgeError, "malformed technocore room"):
+            bridge.technocore_read_room("https://technocore.chat", "lobby")
+        with self.assertRaisesRegex(bridge.RetryableError, "malformed technocore note"):
+            bridge.kv_get("https://technocore.chat", "topic", "lobby")
 
 
 if __name__ == "__main__":
