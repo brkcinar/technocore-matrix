@@ -439,6 +439,18 @@ class BridgeTest(unittest.TestCase):
                 self.assertNotIn(char, cleaned)
         self.assertEqual(bridge.sanitize_line("Ａ  topic\u200b"), "A topic")
 
+    @mock.patch.object(bridge.Bridge, "ensure_joined")
+    @mock.patch.object(bridge.Bridge, "ensure_ghost")
+    @mock.patch.object(bridge, "matrix_request")
+    def test_verified_signed_message_is_sanitized_before_matrix(self, matrix, _ghost, _joined):
+        instance = self.make_bridge()
+        dangerous = "signed\u202e\ntext\u200b\ue000" + chr(0xFDD0)
+        message = self.signed_record(text=dangerous)
+        bridge.deliver_message(instance, "lobby", "!room:matrix.example", message)
+        payload = matrix.call_args.args[4]
+        self.assertEqual(payload, {"msgtype": "m.text", "body": bridge.sanitize_line(dangerous)})
+        self.assertNotEqual(instance.ghost_for_message("lobby", message), instance.ANON_LOCALPART)
+
 
 if __name__ == "__main__":
     unittest.main()

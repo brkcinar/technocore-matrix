@@ -856,7 +856,7 @@ def record_checkpoint(message: dict) -> str:
 
 def deliver_message(bridge: Bridge, room: str, room_id: str, message: dict) -> None:
     localpart = bridge.ghost_for_message(room, message)
-    text = message["text"]
+    text = sanitize_line(message["text"])
     if localpart == bridge.ANON_LOCALPART:
         text = sanitize_line(_format_writer_prefix(message) + text)
     bridge.rate_limiters[room].wait()
