@@ -451,6 +451,31 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(payload, {"msgtype": "m.text", "body": bridge.sanitize_line(dangerous)})
         self.assertNotEqual(instance.ghost_for_message("lobby", message), instance.ANON_LOCALPART)
 
+    @mock.patch.object(bridge.Bridge, "ensure_joined")
+    @mock.patch.object(bridge.Bridge, "ensure_ghost")
+    @mock.patch.object(bridge, "matrix_request")
+    @mock.patch.object(bridge, "sync_topic")
+    @mock.patch.object(bridge.Bridge, "ensure_room", return_value="!room:matrix.example")
+    @mock.patch.object(bridge, "technocore_read_room")
+    def test_lone_surrogate_is_anonymous_and_does_not_break_polling(
+        self, read, _room, _topic, matrix, _ghost, _joined,
+    ):
+        instance = self.make_bridge()
+        surrogate = json.loads('"\\ud800"')
+        message = {
+            "seq": 1, "from": self.did, "text": surrogate, "nonce": 1, "sig": "A" * 86,
+        }
+        view = {"last_seq": 1, "first_seq": 1, "messages": [message]}
+        read.side_effect = [view, view, {"messages": [message]}]
+        self.assertEqual(bridge.poll_room_once(instance, "lobby"), 1)
+        self.assertEqual(instance.cursors["lobby"], 1)
+        self.assertEqual(matrix.call_args.args[4]["body"], f"<~{self.did}>")
+        self.assertFalse(
+            bridge.signed_frame_landed(
+                "https://technocore.chat", "lobby", self.did, surrogate
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

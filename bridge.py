@@ -144,7 +144,7 @@ def verified_record_did(room: str, message: dict) -> str | None:
         Ed25519PublicKey.from_public_bytes(public_bytes).verify(
             raw_signature, f"{room}|{nonce}|{text}".encode()
         )
-    except (ValueError, InvalidSignature):
+    except (UnicodeError, ValueError, InvalidSignature):
         return None
     return did
 
