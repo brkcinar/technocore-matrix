@@ -524,6 +524,31 @@ class BridgeTest(unittest.TestCase):
         with self.assertRaisesRegex(bridge.RetryableError, "malformed technocore note"):
             bridge.kv_get("https://technocore.chat", "topic", "lobby")
 
+    def test_partial_transaction_retry_after_restart_does_not_duplicate_delivered_events(self):
+        instance = self.make_bridge()
+        instance.room_ids["lobby"] = "!r:m"
+        events = [
+            {
+                "event_id": f"$partial-{body}", "sender": "@alice:m", "room_id": "!r:m",
+                "type": "m.room.message", "content": {"msgtype": "m.text", "body": body},
+            }
+            for body in ("first", "second")
+        ]
+        with mock.patch.object(
+            bridge, "technocore_say_signed",
+            side_effect=[None, bridge.RetryableError("temporary failure"), None],
+        ) as send, mock.patch.object(bridge, "signed_frame_landed", return_value=False):
+            with self.assertRaises(bridge.RetryableError):
+                bridge.handle_transaction(instance, "partial-txn", events)
+    
+            reopened = self.make_bridge()
+            reopened.room_ids["lobby"] = "!r:m"
+            bridge.handle_transaction(reopened, "partial-txn", events)
+    
+            self.assertEqual(send.call_count, 3)
+            self.assertEqual(reopened.event_status("$partial-first"), "done")
+            self.assertEqual(reopened.event_status("$partial-second"), "done")
+            self.assertIn("partial-txn", reopened.processed_txns)
 
 if __name__ == "__main__":
     unittest.main()
